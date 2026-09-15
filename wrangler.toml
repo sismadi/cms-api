@@ -7,25 +7,20 @@ compatibility_date = "2026-09-15"
 # ------------------------------------------------------------
 [[d1_databases]]
 binding = "DB"
-database_name = "cms-db"
-database_id = "fb30cb47-9d7a-4ba4-b263-09c4e1f33d3f"
+database_name = "<NAMA_DB>"
+database_id = "<ID_DB>"
 
 # ------------------------------------------------------------
-# Static assets — SATU deployment yang menyajikan:
-#   - Berkas app admin (app.html, engine.js, style.css, dst.) dari
-#     folder ../blog-app secara langsung (tanpa lewat worker.js).
-#   - Fallback ke worker.js untuk path yang tidak cocok berkas apa pun
-#     (ini perilaku DEFAULT Cloudflare Workers Assets: worker hanya
-#     dipanggil kalau tidak ada aset yang match — lihat
-#     developers.cloudflare.com/workers/static-assets/routing/).
+# TIDAK ADA [assets] lagi di sini.
 #
-# PENTING: struktur repo BERUBAH dari versi POS (dulu pos-api & pos-app
-# dua repo/deploy terpisah, frontend fetch ke Worker API lewat absolute
-# URL). Sekarang keduanya HARUS dideploy sebagai SATU Worker (satu
-# origin) agar SSR (piawai.id/:user/:slug) dan app admin berbagi domain
-# yang sama. Letakkan folder blog-app sebagai sibling dari blog-api,
-# atau sesuaikan `directory` di bawah ke lokasi sebenarnya.
+# Repo ini sekarang murni microservice BACKEND (JSON API only), dipisah
+# dari frontend (repo `cms-app`, dideploy sendiri — mis. GitHub Pages).
+# Backend & frontend jadi 2 origin/domain berbeda, komunikasi lewat CORS
+# fetch dengan routing QUERY STRING (?table=, ?view=, dst — lihat
+# worker.js), bukan lagi path segment. Deploy Worker ini sendiri:
+#
+#   wrangler deploy
+#
+# lalu catat URL yang dihasilkan (mis. https://cms-api.<akun>.workers.dev)
+# dan isikan ke API_BASE di cms-app/db.js.
 # ------------------------------------------------------------
-[assets]
-directory = "../blog-app"
-binding = "ASSETS"
