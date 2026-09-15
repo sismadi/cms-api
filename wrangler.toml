@@ -1,0 +1,31 @@
+name = "blog-multiuser"
+main = "worker.js"
+compatibility_date = "2026-09-15"
+
+# ------------------------------------------------------------
+# D1 — isi database_id sesuai hasil `wrangler d1 create <NAMA_DB>`.
+# ------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "<NAMA_DB>"
+database_id = "<ID_DB>"
+
+# ------------------------------------------------------------
+# Static assets — SATU deployment yang menyajikan:
+#   - Berkas app admin (app.html, engine.js, style.css, dst.) dari
+#     folder ../blog-app secara langsung (tanpa lewat worker.js).
+#   - Fallback ke worker.js untuk path yang tidak cocok berkas apa pun
+#     (ini perilaku DEFAULT Cloudflare Workers Assets: worker hanya
+#     dipanggil kalau tidak ada aset yang match — lihat
+#     developers.cloudflare.com/workers/static-assets/routing/).
+#
+# PENTING: struktur repo BERUBAH dari versi POS (dulu pos-api & pos-app
+# dua repo/deploy terpisah, frontend fetch ke Worker API lewat absolute
+# URL). Sekarang keduanya HARUS dideploy sebagai SATU Worker (satu
+# origin) agar SSR (piawai.id/:user/:slug) dan app admin berbagi domain
+# yang sama. Letakkan folder blog-app sebagai sibling dari blog-api,
+# atau sesuaikan `directory` di bawah ke lokasi sebenarnya.
+# ------------------------------------------------------------
+[assets]
+directory = "../blog-app"
+binding = "ASSETS"
