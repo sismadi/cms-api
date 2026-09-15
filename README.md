@@ -35,7 +35,7 @@ diseragamkan menjadi **`cms`**, di seluruh lapisan, tanpa sisa:
 | kolom `kodeToko`       | kolom `kodeCms`      | schema.sql, worker.js, auth.js|
 | query `?tenantId=`     | query `?cmsId=`      | endpoint `/api`               |
 | `view=blog`            | `view=profile`       | endpoint `/public`            |
-| rute `?page=tenant`    | rute `?page=cms`     | cms-app (halaman superadmin)  |
+| rute `?page=tenant`    | rute `?cms`          | cms-app (halaman superadmin)  |
 | `pages/tenant.js`      | `pages/cms.js`       | cms-app                       |
 | `db.allTenants()` dst. | `db.allCms()` dst.   | db.js                         |
 | sesi `blogSession`     | sesi `cmsSession`    | auth.js (localStorage)        |
@@ -45,17 +45,30 @@ Konsekuensi: **sesi login lama otomatis tidak terbaca** (key localStorage
 berubah) — pengguna cukup masuk ulang. Database lama juga tidak kompatibel;
 jalankan `schema.sql` yang baru (lihat Deploy).
 
-## Perubahan v3 — URL publik yang rapi
+## Perubahan v3 — URL yang rapi, satu aturan untuk semua rute
 
-Di v2, URL publik berbentuk pasangan key=value yang panjang:
-`...?page=artikel&user=<kode>&slug=<slug>`. Di v3, rute **publik** memakai
+Di v2, URL berbentuk pasangan key=value yang panjang:
+`...?page=artikel&user=<kode>&slug=<slug>`. Di v3, **semua** rute memakai
 query string yang diisi **segmen mirip path**:
 
-| Halaman     | URL v3                                  |
-|-------------|------------------------------------------|
-| Beranda     | `cms.piawai.id/`                         |
-| Profil CMS  | `cms.piawai.id/?profile/<kodeCms>`       |
-| Artikel     | `cms.piawai.id/?user/<kodeCms>/<slug>`   |
+| Halaman              | URL v3                                   |
+|----------------------|------------------------------------------|
+| Beranda              | `cms.piawai.id/`                         |
+| Profil CMS (publik)  | `cms.piawai.id/?profile/<kodeCms>`       |
+| Artikel (publik)     | `cms.piawai.id/?user/<kodeCms>/<slug>`   |
+| Masuk                | `cms.piawai.id/?login`                   |
+| Daftar               | `cms.piawai.id/?register`                |
+| Dasbor               | `cms.piawai.id/?dashboard`               |
+| Tulis artikel baru   | `cms.piawai.id/?editor`                  |
+| Edit artikel         | `cms.piawai.id/?editor/<idArtikel>`      |
+| Artikel saya         | `cms.piawai.id/?postingan`               |
+| Edit profil sendiri  | `cms.piawai.id/?profil`                  |
+| Kelola CMS (superadmin) | `cms.piawai.id/?cms`                  |
+
+Rute admin IKUT bentuk yang sama — bukan lagi `?page=dashboard`. Sempat
+dipertimbangkan membiarkannya beda (toh tidak dibagikan/diindeks), tapi
+dua aturan URL dalam satu aplikasi lebih mahal diingat dan gampang salah
+dipakai ketimbang satu aturan seragam.
 
 Yang **tidak** berubah: ini tetap query string murni — path selalu `/`,
 jadi hosting statis apa pun (GitHub Pages, Cloudflare Pages, Netlify)
@@ -64,15 +77,21 @@ pun**. Yang diubah hanya *isi* query-nya, supaya alamat enak dibaca dan
 dibagikan. Alasan lengkap kenapa query string (bukan path sungguhan)
 tetap dipakai ada di bagian berikutnya.
 
-Rute **admin** sengaja TETAP format lama `?page=slug&param=nilai`
-(`?page=dashboard`, `?page=editor&id=...`), karena tidak pernah dibagikan
-atau diindeks — tidak ada untungnya dirapikan, dan formatnya lebih mudah
-dibaca saat menambah parameter baru.
+**Aturannya seragam:** segmen pertama = nama rute, segmen berikutnya =
+nilai parameter sesuai urutan di `ROUTE_PARAM_KEYS`. Satu-satunya
+pengecualian terdaftar di `ROUTE_PREFIX`: rute `artikel` memakai prefiks
+`user`, supaya alamat artikel terbaca sebagai milik seorang penulis
+(`?user/wawan/judul`, bukan `?artikel/wawan/judul`).
 
-Implementasinya terpusat di `cms-app/engine.js`:
-`PRETTY_PUBLIC_ROUTES` (peta rute publik), `parseLocationParams()`
-(URL → params), dan `buildQueryString()` (params → URL). Menambah rute
-publik baru cukup menambah satu entri di `PRETTY_PUBLIC_ROUTES`.
+Implementasinya terpusat di `cms-app/engine.js`: `ROUTE_PARAM_KEYS`,
+`ROUTE_PREFIX`, `parseLocationParams()` (URL → params),
+`buildQueryString()` (params → URL), dan `web.href()` (pembangun href
+untuk semua halaman). Tidak ada berkas lain yang merakit URL sendiri,
+jadi kalau format URL diubah lagi, cukup berkas ini yang disentuh.
+
+**Tautan lama tetap terbuka.** `parseLocationParams()` masih menerima
+bentuk `?page=x&param=y`, jadi bookmark atau tautan yang sudah terlanjur
+tersebar sebelum v3 tidak mati — hanya tidak lagi diproduksi.
 
 ## Kenapa query string, bukan path?
 
@@ -134,17 +153,23 @@ belakang API gateway ketimbang segmen posisional.
 
 ## Rute frontend (`cms-app`)
 
-Publik (bentuk rapi, lihat tabel di atas): beranda `/`,
-`?profile/<kodeCms>`, `?user/<kodeCms>/<slug>` — semuanya di
-`pages/public.js`.
+Publik: beranda `/`, `?profile/<kodeCms>`, `?user/<kodeCms>/<slug>` —
+semuanya di `pages/public.js`.
 
-Admin (butuh login, format `?page=`): `login`, `register`, `dashboard`,
-`editor` (+ `&id=`), `postingan`, `profil` (edit profil CMS sendiri),
-`cms` (kelola semua CMS, khusus superadmin).
+Admin (butuh login): `?login`, `?register`, `?dashboard`, `?editor`
+(+ `/<idArtikel>` untuk mengedit), `?postingan`, `?profil` (edit profil
+CMS sendiri), `?cms` (kelola semua CMS, khusus superadmin).
 
 Perhatikan pasangan nama yang sengaja dibedakan: `?profile/<kodeCms>`
-adalah halaman PUBLIK yang dilihat pengunjung, sedangkan `?page=profil`
+adalah halaman PUBLIK yang dilihat pengunjung, sedangkan `?profil`
 adalah FORM EDIT halaman tersebut, khusus pemiliknya.
+
+Catatan `robots.txt`: karena rute ada di query string, aturan lama
+bergaya path (`Disallow: /dashboard`) tidak cocok dengan URL apa pun dan
+sudah diganti bentuk query (`Disallow: /?dashboard`). `Allow: /?profile`
+sengaja dicantumkan karena `Disallow: /?profil` juga mencocoki awalan
+URL profil publik; aturan yang lebih panjang menang, jadi halaman publik
+tetap boleh diindeks.
 
 Tidak ada konsep "reserved slug" (kata terlarang untuk `kodeCms`) —
 `kodeCms` tidak pernah jadi nama rute, dia selalu jadi nilai di dalam
