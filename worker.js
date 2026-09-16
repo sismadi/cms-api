@@ -1,256 +1,779 @@
 // ============================================================
-// worker.js — API BACKEND MURNI untuk PLATFORM CMS MULTI-USER (Cloudflare Worker + D1).
+// worker.js — API BACKEND CMS MULTI-USER (Cloudflare Worker + D1)
+// VERSI TER-HARDENING — menutup temuan di SECURITY.md (repo cms-app).
 // ============================================================
-// PERUBAHAN ARSITEKTUR: repo ini sekarang HANYA backend (microservice
-// API), dipisah total dari frontend (repo `cms-app`, dideploy sendiri
-// mis. di GitHub Pages — lihat README.md). Konsekuensinya:
+// Ringkas perubahan keamanan dibanding versi sebelumnya:
 //
-//   1. TIDAK ADA lagi SSR halaman publik di sini. Worker ini murni
-//      mengembalikan JSON; yang merender HTML adalah frontend (client-side).
-//   2. TIDAK ADA lagi static assets binding — repo ini tidak menyajikan
-//      index.html/engine.js/dst. Frontend punya deployment/origin sendiri.
-//   3. ROUTING PAKAI QUERY STRING, BUKAN PATH SEGMENT. Karena frontend &
-//      backend sekarang 2 origin terpisah (klasik microservices: setiap
-//      layanan komunikasi lewat kontrak API, bukan berbagi routing path
-//      di 1 origin), path bawaan seperti /api/:table/:id tidak lagi
-//      relevan — semua parameter (table, id, cmsId, view, dst.)
-//      dikirim sebagai query string. Ini juga membuat backend lebih
-//      mudah diletakkan di belakang API gateway/query router apa pun
-//      tanpa perlu aturan path-rewrite.
+//  1. Password TIDAK PERNAH keluar dari server. Tabel `users` dan
+//     `komentar` diblokir total dari CRUD generik /api. Satu-satunya
+//     jalan autentikasi adalah POST /public?view=login|register.
+//  2. Password disimpan sebagai hash PBKDF2-SHA256 (salt per-user,
+//     210.000 iterasi) — kolom `users.passwordHash`, bukan `password`.
+//  3. Otorisasi TIDAK lagi memercayai `cmsId`/`role` dari klien.
+//     Keduanya diturunkan dari token sesi HMAC-SHA256 yang
+//     diverifikasi di server (header `Authorization: Bearer <token>`).
+//     Parameter `cmsId` di query string diabaikan sepenuhnya.
+//  4. Turnstile diverifikasi di server lewat `siteverify` sebelum
+//     login/registrasi diproses.
+//  5. Rate limiting nyata di D1 (tabel `rate_limit`): per-IP dan
+//     per-akun untuk login/registrasi, per-user untuk komentar.
+//  6. `post.konten` di-sanitize di server (allowlist) saat disimpan
+//     DAN saat disajikan lewat /public — jadi konsumen API lain
+//     (mobile app, integrasi pihak ketiga) ikut terlindungi.
+//  7. Nama kolom di INSERT/UPDATE di-allowlist. Versi lama merakit
+//     `INSERT INTO t (${Object.keys(body)})` dari body klien —
+//     itu injeksi SQL lewat nama kolom, bukan cuma masalah data.
+//  8. CORS tidak lagi `*`: hanya origin yang terdaftar (ALLOWED_ORIGINS).
 //
-// Ada 2 "permukaan" endpoint:
-//   GET/POST/PATCH/DELETE /api?table=...&id=...&cmsId=...
-//     -> CRUD generik (persis pola versi POS/monolith sebelumnya, hanya
-//        parameternya sekarang di query string, bukan di path).
-//   GET/POST /public?view=...&user=...&slug=...
-//     -> data siap-pakai untuk halaman publik (dulu di-SSR di sini,
-//        sekarang cuma JSON — frontend yang merender HTML-nya).
-//
-// ------------------------------------------------------------
-// ISOLASI CMS (SAMA seperti versi sebelumnya — lihat catatan lama)
-// ------------------------------------------------------------
-// Semua tabel scoped WAJIB ?cmsId= di /api, dan diverifikasi baris
-// per baris sebelum GET-by-id/PATCH/DELETE. cmsId dikirim klien lewat
-// query string, BUKAN diverifikasi via token sesi tervalidasi server-side
-// — cukup untuk mencegah bug frontend membocorkan data cms lain, TAPI
-// TIDAK mencegah pengguna nakal mengganti cmsId di devtools. Untuk
-// produksi sungguhan: ganti dengan JWT/sesi yang diverifikasi di Worker.
+// Secret/variable yang WAJIB di-set (lihat README.md):
+//   wrangler secret put SESSION_SECRET
+//   wrangler secret put TURNSTILE_SECRET_KEY
+//   (opsional) vars ALLOWED_ORIGINS = "https://cms.piawai.id"
 // ============================================================
 
-const SCOPED_TABLES = new Set(['users', 'post', 'komentar']);
+// ------------------------------------------------------------
+// Konfigurasi
+// ------------------------------------------------------------
+const SESSION_TTL_MS = 12 * 60 * 60 * 1000;      // 12 jam
+const PBKDF2_ITERATIONS = 210_000;
+const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,29}$/;
+const USERNAME_RE = /^[A-Za-z0-9._-]{3,40}$/;
+const DEFAULT_ORIGINS = [
+  'https://cms.piawai.id',
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+];
 
-const TABLES = {
-  cms:      { jsonCols: [] },
-  users:    { jsonCols: [] },
-  post:     { jsonCols: [] },
-  komentar: { jsonCols: [] },
+// Tabel yang TIDAK BOLEH disentuh lewat CRUD generik /api sama sekali.
+// `users` memuat kredensial; `komentar` hanya boleh lewat endpoint
+// publik yang mengambil identitas dari token.
+const BLOCKED_TABLES = new Set(['users', 'komentar']);
+
+// Kolom yang boleh ditulis klien, per tabel. Apa pun di luar daftar ini
+// dibuang diam-diam — termasuk `id`, `cmsId`, `views` yang ditentukan server.
+const WRITABLE_COLUMNS = {
+  post: ['slug', 'judul', 'ringkasan', 'konten', 'coverImage', 'kategori', 'tags', 'status', 'publishedAt'],
+  cms: ['nama', 'bio', 'avatarUrl'],
 };
+// Kolom `cms` yang hanya boleh diubah superadmin.
+const CMS_SUPERADMIN_COLUMNS = ['status'];
 
-const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,29}$/; // 2-30 char, lowercase, angka, strip
-
+// ------------------------------------------------------------
+// Util dasar
+// ------------------------------------------------------------
 function genId(table) {
-  return table + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+  return table + '_' + Date.now().toString(36) + crypto.randomUUID().replace(/-/g, '').slice(0, 8);
 }
 
-function json(data, status = 200) {
+function corsHeaders(request, env) {
+  const allowed = String(env.ALLOWED_ORIGINS || DEFAULT_ORIGINS.join(','))
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const origin = request.headers.get('Origin') || '';
+  const h = {
+    'Vary': 'Origin',
+    'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Max-Age': '86400',
+  };
+  if (origin && allowed.includes(origin)) h['Access-Control-Allow-Origin'] = origin;
+  return h;
+}
+
+function json(data, status = 200, extraHeaders = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      ...extraHeaders,
+    },
+  });
+}
+
+/** Error terkontrol — pesan ini AMAN ditampilkan ke pengguna. */
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+function clientIp(request) {
+  return request.headers.get('CF-Connecting-IP')
+    || request.headers.get('X-Forwarded-For')?.split(',')[0].trim()
+    || 'unknown';
+}
+
+const enc = new TextEncoder();
+
+function b64urlEncode(bytes) {
+  let s = '';
+  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  for (const b of arr) s += String.fromCharCode(b);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecode(str) {
+  const pad = str.length % 4 ? '='.repeat(4 - (str.length % 4)) : '';
+  const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/') + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** Perbandingan waktu-konstan untuk hash/signature. */
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+
+// ------------------------------------------------------------
+// [KRITIS #1] Hashing password — PBKDF2-SHA256 lewat Web Crypto.
+// Format tersimpan: pbkdf2$sha256$<iterasi>$<saltB64url>$<hashB64url>
+// Argon2id lebih ideal, tapi tidak tersedia native di Workers runtime;
+// PBKDF2 210k iterasi adalah rekomendasi OWASP untuk SHA-256.
+// ------------------------------------------------------------
+async function pbkdf2(password, salt, iterations) {
+  const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256);
+  return new Uint8Array(bits);
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(password, salt, PBKDF2_ITERATIONS);
+  return `pbkdf2$sha256$${PBKDF2_ITERATIONS}$${b64urlEncode(salt)}$${b64urlEncode(hash)}`;
+}
+
+async function verifyPassword(password, stored) {
+  const parts = String(stored || '').split('$');
+  if (parts.length !== 5 || parts[0] !== 'pbkdf2') return false;
+  const iterations = parseInt(parts[2], 10);
+  if (!Number.isFinite(iterations) || iterations < 1000) return false;
+  const salt = b64urlDecode(parts[3]);
+  const expected = b64urlDecode(parts[4]);
+  const actual = await pbkdf2(password, salt, iterations);
+  return timingSafeEqual(actual, expected);
+}
+
+// ------------------------------------------------------------
+// [KRITIS #2] Token sesi — HMAC-SHA256 bertanda tangan server.
+// Payload: { uid, cid, kode, cmsNama, username, name, role, iat, exp }
+// cmsId & role SELALU dibaca dari sini, tidak pernah dari klien.
+// ------------------------------------------------------------
+async function hmacKey(env) {
+  const secret = env.SESSION_SECRET;
+  if (!secret || String(secret).length < 32) {
+    throw new HttpError(500, 'Server belum dikonfigurasi (SESSION_SECRET kosong atau terlalu pendek).');
+  }
+  return crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+}
+
+async function signSession(env, payload) {
+  const body = { ...payload, iat: Date.now(), exp: Date.now() + SESSION_TTL_MS };
+  const data = b64urlEncode(enc.encode(JSON.stringify(body)));
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(env), enc.encode(data));
+  return { token: `${data}.${b64urlEncode(sig)}`, payload: body };
+}
+
+async function verifySession(env, token) {
+  if (!token || typeof token !== 'string' || !token.includes('.')) return null;
+  const [data, sig] = token.split('.');
+  let expected;
+  try {
+    expected = new Uint8Array(await crypto.subtle.sign('HMAC', await hmacKey(env), enc.encode(data)));
+  } catch (e) { throw e; }
+  let given;
+  try { given = b64urlDecode(sig || ''); } catch (e) { return null; }
+  if (!timingSafeEqual(expected, given)) return null;
+  let payload;
+  try { payload = JSON.parse(new TextDecoder().decode(b64urlDecode(data))); } catch (e) { return null; }
+  if (!payload?.exp || Date.now() > payload.exp) return null;
+  return payload;
+}
+
+/** Ambil sesi dari header Authorization; lempar 401 kalau tidak sah. */
+async function requireSession(request, env) {
+  const raw = request.headers.get('Authorization') || '';
+  const token = raw.startsWith('Bearer ') ? raw.slice(7).trim() : '';
+  const session = await verifySession(env, token);
+  if (!session) throw new HttpError(401, 'Sesi tidak valid atau sudah berakhir. Silakan masuk kembali.');
+  return session;
+}
+
+// ------------------------------------------------------------
+// [TINGGI #3] Verifikasi Turnstile di server.
+// Fail-closed: kalau secret belum di-set, permintaan ditolak — supaya
+// tidak ada mode "seolah-olah ada captcha" yang sebenarnya kosong.
+// ------------------------------------------------------------
+async function verifyTurnstile(env, token, ip) {
+  if (!env.TURNSTILE_SECRET_KEY) {
+    throw new HttpError(500, 'Server belum dikonfigurasi (TURNSTILE_SECRET_KEY kosong).');
+  }
+  if (!token) throw new HttpError(400, 'Verifikasi captcha wajib diselesaikan.');
+  const form = new FormData();
+  form.append('secret', env.TURNSTILE_SECRET_KEY);
+  form.append('response', token);
+  if (ip && ip !== 'unknown') form.append('remoteip', ip);
+  let result;
+  try {
+    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
+    result = await res.json();
+  } catch (e) {
+    throw new HttpError(503, 'Gagal memverifikasi captcha, coba lagi sebentar lagi.');
+  }
+  if (!result?.success) throw new HttpError(400, 'Verifikasi captcha gagal. Muat ulang halaman dan coba lagi.');
+}
+
+// ------------------------------------------------------------
+// [TINGGI #4] Rate limiting nyata di D1 (tabel `rate_limit`).
+// Dipakai per-IP dan per-akun; lockout ditegakkan SEBELUM password
+// dicocokkan, jadi bot yang memanggil API langsung tetap kena.
+// ------------------------------------------------------------
+async function rateLimitCheck(db, key, { max, windowMs, blockMs }) {
+  const now = Date.now();
+  const row = await db.prepare(`SELECT * FROM rate_limit WHERE key = ?`).bind(key).first();
+  if (row && row.blockedUntil > now) {
+    throw new HttpError(429, `Terlalu banyak percobaan. Coba lagi dalam ${Math.ceil((row.blockedUntil - now) / 1000)} detik.`);
+  }
+  if (!row || (now - row.windowStart) > windowMs) {
+    await db.prepare(
+      `INSERT INTO rate_limit (key, count, windowStart, blockedUntil) VALUES (?, 0, ?, 0)
+       ON CONFLICT(key) DO UPDATE SET count = 0, windowStart = ?, blockedUntil = 0`
+    ).bind(key, now, now).run();
+    return;
+  }
+  if (row.count >= max) {
+    const until = now + blockMs;
+    await db.prepare(`UPDATE rate_limit SET blockedUntil = ?, count = 0, windowStart = ? WHERE key = ?`)
+      .bind(until, now, key).run();
+    throw new HttpError(429, `Terlalu banyak percobaan. Coba lagi dalam ${Math.ceil(blockMs / 1000)} detik.`);
+  }
+}
+
+async function rateLimitHit(db, key) {
+  const now = Date.now();
+  await db.prepare(
+    `INSERT INTO rate_limit (key, count, windowStart, blockedUntil) VALUES (?, 1, ?, 0)
+     ON CONFLICT(key) DO UPDATE SET count = count + 1`
+  ).bind(key, now).run();
+}
+
+async function rateLimitReset(db, key) {
+  await db.prepare(`DELETE FROM rate_limit WHERE key = ?`).bind(key).run().catch(() => {});
+}
+
+// ------------------------------------------------------------
+// [SEDANG #5] Sanitasi HTML sisi server untuk `post.konten`.
+// Allowlist tag + atribut (bukan blocklist). Dipakai saat menyimpan
+// DAN saat menyajikan, jadi baris lama yang sudah terlanjur kotor
+// tetap bersih ketika dibaca.
+// ------------------------------------------------------------
+const ALLOWED_TAGS = {
+  p: [], br: [], hr: [], strong: [], b: [], em: [], i: [], u: [], s: [],
+  h1: [], h2: [], h3: [], h4: [], h5: [], h6: [],
+  ul: [], ol: [], li: [], blockquote: [], pre: [], code: [], span: [],
+  figure: [], figcaption: [], table: [], thead: [], tbody: [], tr: [],
+  th: ['colspan', 'rowspan'], td: ['colspan', 'rowspan'],
+  a: ['href', 'title'], img: ['src', 'alt', 'title', 'width', 'height'],
+};
+const VOID_TAGS = new Set(['br', 'hr', 'img']);
+
+/** Normalkan entity & whitespace supaya `java&#115;cript:` tidak lolos. */
+function decodeEntities(str) {
+  return String(str)
+    .replace(/&#x([0-9a-f]+);?/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);?/g, (_, d) => String.fromCharCode(parseInt(d, 10)))
+    .replace(/&amp;/gi, '&');
+}
+
+function safeUrl(value, { allowMailto = false } = {}) {
+  const v = decodeEntities(value).replace(/[\u0000-\u0020]/g, '').toLowerCase();
+  if (/^(javascript|data|vbscript|file|blob):/i.test(v)) return null;
+  if (/^[a-z][a-z0-9+.-]*:/i.test(v)) {
+    if (v.startsWith('http://') || v.startsWith('https://')) return value;
+    if (allowMailto && v.startsWith('mailto:')) return value;
+    return null;
+  }
+  return value; // relatif / anchor / protocol-relative dibiarkan apa adanya
+}
+
+function escapeAttr(v) {
+  return String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function sanitizeHtml(input) {
+  let html = String(input || '');
+  // Buang komentar dan elemen yang isinya pun berbahaya (beserta kontennya).
+  html = html.replace(/<!--[\s\S]*?-->/g, '');
+  html = html.replace(/<\s*(script|style|iframe|object|embed|noscript|template|svg|math)\b[\s\S]*?<\s*\/\s*\1\s*>/gi, '');
+  html = html.replace(/<\s*\/?\s*(script|style|iframe|object|embed|noscript|template|svg|math)\b[^>]*>/gi, '');
+
+  return html.replace(/<\/?([a-zA-Z][a-zA-Z0-9]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g, (full, rawName, rawAttrs) => {
+    const name = rawName.toLowerCase();
+    if (!(name in ALLOWED_TAGS)) return '';
+    if (full.startsWith('</')) return VOID_TAGS.has(name) ? '' : `</${name}>`;
+
+    const allowedAttrs = ALLOWED_TAGS[name];
+    let out = `<${name}`;
+    const attrRe = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*("([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/g;
+    let m;
+    while ((m = attrRe.exec(rawAttrs)) !== null) {
+      const attr = m[1].toLowerCase();
+      const value = m[3] ?? m[4] ?? m[5] ?? '';
+      if (attr.startsWith('on')) continue;             // semua event handler
+      if (!allowedAttrs.includes(attr)) continue;      // allowlist per tag
+      if (attr === 'href' || attr === 'src') {
+        const safe = safeUrl(value, { allowMailto: attr === 'href' });
+        if (safe === null) continue;
+        out += ` ${attr}="${escapeAttr(safe)}"`;
+        continue;
+      }
+      out += ` ${attr}="${escapeAttr(value)}"`;
+    }
+    if (name === 'a') out += ' rel="noopener noreferrer nofollow"';
+    return VOID_TAGS.has(name) ? out + '>' : out + '>';
   });
 }
 
 // ------------------------------------------------------------
-// /api — CRUD generik. Semua parameter (table, id, cmsId) di QUERY
-// STRING, bukan path — lihat catatan arsitektur di atas berkas ini.
-//   GET    /api?table=post&cmsId=T               -> list
-//   GET    /api?table=post&id=I&cmsId=T          -> detail
-//   POST   /api?table=post                       -> create (body JSON)
-//   PATCH  /api?table=post&id=I&cmsId=T          -> update (body JSON)
-//   DELETE /api?table=post&id=I&cmsId=T          -> delete
+// Helper penulisan DB dengan kolom ter-allowlist (anti injeksi nama kolom)
+// ------------------------------------------------------------
+function pickColumns(body, allowed) {
+  const out = {};
+  for (const col of allowed) {
+    if (body[col] !== undefined) out[col] = body[col];
+  }
+  return out;
+}
+
+async function insertRow(db, table, record) {
+  const cols = Object.keys(record);
+  await db.prepare(
+    `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+  ).bind(...cols.map(c => record[c])).run();
+  return record;
+}
+
+async function updateRow(db, table, id, patch) {
+  const cols = Object.keys(patch);
+  if (!cols.length) return;
+  await db.prepare(
+    `UPDATE ${table} SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE id = ?`
+  ).bind(...cols.map(c => patch[c]), id).run();
+}
+
+// ------------------------------------------------------------
+// /api — CRUD generik, SEKARANG WAJIB TOKEN.
+//   GET    /api?table=post            -> list (otomatis di-scope ke cms token)
+//   GET    /api?table=post&id=I       -> detail
+//   POST   /api?table=post            -> create
+//   PATCH  /api?table=post&id=I       -> update
+//   DELETE /api?table=post&id=I       -> delete
+// Parameter `cmsId` dari klien DIABAIKAN — nilainya diambil dari token.
 // ------------------------------------------------------------
 async function handleApi(request, env) {
+  const session = await requireSession(request, env);
   const url = new URL(request.url);
   const table = url.searchParams.get('table');
   const id = url.searchParams.get('id');
-
-  if (!table) return json({ error: "Query 'table' wajib diisi" }, 400);
-  if (!(table in TABLES)) return json({ error: `Tabel '${table}' tidak dikenal` }, 400);
-
-  const scoped = SCOPED_TABLES.has(table);
-  const cmsId = url.searchParams.get('cmsId');
   const db = env.DB;
 
-  if (scoped && !cmsId && request.method !== 'OPTIONS') {
-    return json({ error: `cmsId wajib untuk tabel '${table}'` }, 400);
+  if (!table) throw new HttpError(400, "Query 'table' wajib diisi");
+  if (BLOCKED_TABLES.has(table)) {
+    throw new HttpError(403, `Tabel '${table}' tidak dapat diakses lewat /api. Gunakan endpoint khusus.`);
+  }
+  if (table !== 'post' && table !== 'cms') throw new HttpError(400, `Tabel '${table}' tidak dikenal`);
+
+  const isSuper = session.role === 'superadmin';
+
+  // ---------- tabel `post` (selalu ter-scope ke cms milik token) ----------
+  if (table === 'post') {
+    const cmsId = session.cid;
+
+    if (request.method === 'GET') {
+      if (id) {
+        const row = await db.prepare(`SELECT * FROM post WHERE id = ? AND cmsId = ?`).bind(id, cmsId).first();
+        return json(row || null, row ? 200 : 404);
+      }
+      const { results } = await db.prepare(`SELECT * FROM post WHERE cmsId = ? ORDER BY createdAt DESC`).bind(cmsId).all();
+      return json(results);
+    }
+
+    const body = request.method === 'POST' || request.method === 'PATCH'
+      ? await request.json().catch(() => ({})) : {};
+
+    if (request.method === 'POST' && !id) {
+      const data = pickColumns(body, WRITABLE_COLUMNS.post);
+      const slug = String(data.slug || '').trim().toLowerCase();
+      if (!SLUG_RE.test(slug)) throw new HttpError(400, 'Slug artikel harus 2-30 karakter: huruf kecil, angka, atau tanda strip.');
+      const judul = String(data.judul || '').trim().slice(0, 200);
+      if (!judul) throw new HttpError(400, 'Judul artikel wajib diisi.');
+      const status = data.status === 'publish' ? 'publish' : 'draft';
+      const now = new Date().toISOString();
+
+      const record = {
+        id: genId('post'), cmsId, slug, judul,
+        ringkasan: String(data.ringkasan || '').slice(0, 500),
+        konten: sanitizeHtml(data.konten || ''),
+        coverImage: safeUrl(String(data.coverImage || '')) || null,
+        kategori: String(data.kategori || '').slice(0, 80),
+        tags: String(data.tags || '').slice(0, 200),
+        status, views: 0,
+        publishedAt: status === 'publish' ? now : null,
+        createdAt: now, updatedAt: now,
+      };
+      try {
+        await insertRow(db, 'post', record);
+      } catch (e) {
+        if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Slug artikel sudah dipakai di CMS ini.');
+        throw e;
+      }
+      return json(record, 201);
+    }
+
+    if (request.method === 'PATCH' && id) {
+      const existing = await db.prepare(`SELECT * FROM post WHERE id = ? AND cmsId = ?`).bind(id, cmsId).first();
+      if (!existing) throw new HttpError(404, 'Artikel tidak ditemukan.');
+
+      const data = pickColumns(body, WRITABLE_COLUMNS.post);
+      const patch = {};
+      if (data.slug !== undefined) {
+        const slug = String(data.slug).trim().toLowerCase();
+        if (!SLUG_RE.test(slug)) throw new HttpError(400, 'Slug artikel harus 2-30 karakter: huruf kecil, angka, atau tanda strip.');
+        patch.slug = slug;
+      }
+      if (data.judul !== undefined) patch.judul = String(data.judul).trim().slice(0, 200);
+      if (data.ringkasan !== undefined) patch.ringkasan = String(data.ringkasan).slice(0, 500);
+      if (data.konten !== undefined) patch.konten = sanitizeHtml(data.konten);
+      if (data.coverImage !== undefined) patch.coverImage = safeUrl(String(data.coverImage || '')) || null;
+      if (data.kategori !== undefined) patch.kategori = String(data.kategori).slice(0, 80);
+      if (data.tags !== undefined) patch.tags = String(data.tags).slice(0, 200);
+      if (data.status !== undefined) {
+        patch.status = data.status === 'publish' ? 'publish' : 'draft';
+        if (patch.status === 'publish' && !existing.publishedAt) patch.publishedAt = new Date().toISOString();
+      }
+      patch.updatedAt = new Date().toISOString();
+
+      try {
+        await updateRow(db, 'post', id, patch);
+      } catch (e) {
+        if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Slug artikel sudah dipakai di CMS ini.');
+        throw e;
+      }
+      return json({ ...existing, ...patch });
+    }
+
+    if (request.method === 'DELETE' && id) {
+      const existing = await db.prepare(`SELECT id FROM post WHERE id = ? AND cmsId = ?`).bind(id, cmsId).first();
+      if (!existing) return json({ ok: true }); // idempotent, tanpa membocorkan keberadaan id
+      await db.batch([
+        db.prepare(`DELETE FROM komentar WHERE postId = ?`).bind(id),
+        db.prepare(`DELETE FROM post WHERE id = ?`).bind(id),
+      ]);
+      return json({ ok: true });
+    }
+
+    throw new HttpError(405, 'Method not allowed');
   }
 
+  // ---------- tabel `cms` ----------
+  // Superadmin melihat semua; pengguna biasa HANYA barisnya sendiri.
   if (request.method === 'GET') {
     if (id) {
-      const row = await db.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
-      if (scoped && row && row.cmsId !== cmsId) return json(null, 404);
-      return json(row || null);
+      if (!isSuper && id !== session.cid) throw new HttpError(404, 'Tidak ditemukan.');
+      const row = await db.prepare(`SELECT * FROM cms WHERE id = ?`).bind(id).first();
+      return json(row || null, row ? 200 : 404);
     }
-    const stmt = scoped
-      ? db.prepare(`SELECT * FROM ${table} WHERE cmsId = ?`).bind(cmsId)
-      : db.prepare(`SELECT * FROM ${table}`);
+    const stmt = isSuper
+      ? db.prepare(`SELECT * FROM cms ORDER BY nama ASC`)
+      : db.prepare(`SELECT * FROM cms WHERE id = ?`).bind(session.cid);
     const { results } = await stmt.all();
     return json(results);
   }
 
+  if (request.method === 'PATCH' && id) {
+    if (!isSuper && id !== session.cid) throw new HttpError(403, 'Anda tidak berhak mengubah CMS ini.');
+    const existing = await db.prepare(`SELECT * FROM cms WHERE id = ?`).bind(id).first();
+    if (!existing) throw new HttpError(404, 'CMS tidak ditemukan.');
+
+    const body = await request.json().catch(() => ({}));
+    const allowed = isSuper
+      ? [...WRITABLE_COLUMNS.cms, ...CMS_SUPERADMIN_COLUMNS]
+      : WRITABLE_COLUMNS.cms; // kodeCms & status TIDAK bisa diubah pemilik
+    const data = pickColumns(body, allowed);
+    const patch = {};
+    if (data.nama !== undefined) patch.nama = String(data.nama).trim().slice(0, 80);
+    if (data.bio !== undefined) patch.bio = String(data.bio).slice(0, 300);
+    if (data.avatarUrl !== undefined) patch.avatarUrl = safeUrl(String(data.avatarUrl || '')) || null;
+    if (data.status !== undefined) patch.status = data.status === 'nonaktif' ? 'nonaktif' : 'aktif';
+    if (!Object.keys(patch).length) throw new HttpError(400, 'Tidak ada field yang bisa diperbarui.');
+
+    await updateRow(db, 'cms', id, patch);
+    return json({ ...existing, ...patch });
+  }
+
+  // Pembuatan CMS baru HANYA lewat /public?view=register (agar sekalian
+  // membuat akun owner + hash password + captcha), atau oleh superadmin.
   if (request.method === 'POST' && !id) {
-    const body = await request.json();
-
-    // Jaring pengaman: kodeCms cms baru wajib url-safe. (Daftar kata
-    // "reserved" terhadap path admin TIDAK diperlukan lagi di sini — di
-    // arsitektur baru, kodeCms cuma jadi NILAI query string `?user=`
-    // di frontend, tidak pernah jadi path segment yang bisa bentrok
-    // dengan rute admin. Lihat README.md.)
-    if (table === 'cms') {
-      const kode = String(body.kodeCms || '').trim().toLowerCase();
-      if (!SLUG_RE.test(kode)) {
-        return json({ error: 'Kode/slug CMS harus 2-30 karakter: huruf kecil, angka, atau tanda strip.' }, 400);
-      }
-      body.kodeCms = kode;
+    if (!isSuper) throw new HttpError(403, 'Pembuatan CMS dilakukan lewat halaman registrasi.');
+    const body = await request.json().catch(() => ({}));
+    const kode = String(body.kodeCms || '').trim().toLowerCase();
+    if (!SLUG_RE.test(kode)) throw new HttpError(400, 'Kode CMS harus 2-30 karakter: huruf kecil, angka, atau tanda strip.');
+    const record = {
+      id: genId('cms'), kodeCms: kode,
+      nama: String(body.nama || kode).trim().slice(0, 80),
+      bio: String(body.bio || '').slice(0, 300),
+      avatarUrl: safeUrl(String(body.avatarUrl || '')) || null,
+      status: 'aktif', createdAt: new Date().toISOString(),
+    };
+    try { await insertRow(db, 'cms', record); }
+    catch (e) {
+      if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Kode CMS sudah dipakai.');
+      throw e;
     }
-
-    if (scoped) {
-      if (!body.cmsId) return json({ error: 'cmsId wajib diisi pada data yang dikirim' }, 400);
-      if (body.cmsId !== cmsId) return json({ error: 'cmsId pada data tidak cocok dengan query' }, 403);
-    }
-    const record = { id: body.id || genId(table), ...body };
-    const cols = Object.keys(record);
-    await db
-      .prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
-      .bind(...cols.map(c => record[c]))
-      .run();
     return json(record, 201);
   }
 
-  if (request.method === 'PATCH' && id) {
-    const patch = await request.json();
-    const existing = await db.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
-    if (!existing) return json(null, 404);
-    if (scoped && existing.cmsId !== cmsId) return json(null, 404);
-
-    const merged = { ...existing, ...patch };
-    if (scoped) merged.cmsId = existing.cmsId; // cmsId tidak boleh dipindah lewat PATCH
-    const cols = Object.keys(merged).filter(c => c !== 'id');
-    await db
-      .prepare(`UPDATE ${table} SET ${cols.map(c => `${c} = ?`).join(', ')} WHERE id = ?`)
-      .bind(...cols.map(c => merged[c]), id)
-      .run();
-    return json(merged);
-  }
-
   if (request.method === 'DELETE' && id) {
-    const existing = await db.prepare(`SELECT * FROM ${table} WHERE id = ?`).bind(id).first();
-    if (!existing) return json({ ok: true }); // idempotent
-    if (scoped && existing.cmsId !== cmsId) return json({ error: 'Tidak ditemukan' }, 404);
-    await db.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(id).run();
+    if (!isSuper) throw new HttpError(403, 'Hanya superadmin yang dapat menghapus CMS.');
+    await db.batch([
+      db.prepare(`DELETE FROM komentar WHERE cmsId = ?`).bind(id),
+      db.prepare(`DELETE FROM post WHERE cmsId = ?`).bind(id),
+      db.prepare(`DELETE FROM users WHERE cmsId = ?`).bind(id),
+      db.prepare(`DELETE FROM cms WHERE id = ?`).bind(id),
+    ]);
     return json({ ok: true });
   }
 
-  return json({ error: 'Method not allowed' }, 405);
+  throw new HttpError(405, 'Method not allowed');
 }
 
 // ------------------------------------------------------------
-// /public — data siap-pakai untuk halaman publik (dulu di-SSR jadi HTML
-// langsung di Worker; sekarang cuma JSON, frontend yang merender).
+// /public — data publik + endpoint auth.
 //   GET  /public?view=home
 //   GET  /public?view=profile&user=<kodeCms>
 //   GET  /public?view=artikel&user=<kodeCms>&slug=<slug>
-//   POST /public?view=komentar&user=<kodeCms>&slug=<slug>   body:{nama,email,isi}
+//   POST /public?view=login      body:{kodeCms,username,password,turnstileToken}
+//   POST /public?view=register   body:{kodeCms,namaCms,bio,ownerName,username,password,turnstileToken}
+//   POST /public?view=komentar&user=<kodeCms>&slug=<slug>  body:{isi}  + Bearer token
 // ------------------------------------------------------------
 async function handlePublic(request, env) {
   const url = new URL(request.url);
   const view = url.searchParams.get('view');
   const userSlug = (url.searchParams.get('user') || '').toLowerCase();
   const postSlug = url.searchParams.get('slug') || '';
+  const db = env.DB;
 
   if (view === 'home') {
-    const { results } = await env.DB
-      .prepare(`SELECT kodeCms, nama, bio, avatarUrl FROM cms WHERE status = 'aktif' AND id != 'system' ORDER BY nama ASC`)
-      .all();
+    const { results } = await db.prepare(
+      `SELECT kodeCms, nama, bio, avatarUrl FROM cms WHERE status = 'aktif' AND id != 'system' ORDER BY nama ASC`
+    ).all();
     return json({ cms: results });
   }
 
   if (view === 'profile') {
-    const cms = await env.DB.prepare(`SELECT * FROM cms WHERE kodeCms = ? AND status = 'aktif'`).bind(userSlug).first();
-    if (!cms) return json({ error: `CMS "${userSlug}" tidak ditemukan.` }, 404);
-    const { results: posts } = await env.DB
-      .prepare(`SELECT slug, judul, ringkasan, kategori, publishedAt FROM post WHERE cmsId = ? AND status = 'publish' ORDER BY publishedAt DESC LIMIT 30`)
-      .bind(cms.id).all();
+    const cms = await db.prepare(
+      `SELECT id, kodeCms, nama, bio, avatarUrl, status FROM cms WHERE kodeCms = ? AND status = 'aktif'`
+    ).bind(userSlug).first();
+    if (!cms) throw new HttpError(404, `CMS "${userSlug}" tidak ditemukan.`);
+    const { results: posts } = await db.prepare(
+      `SELECT slug, judul, ringkasan, kategori, publishedAt FROM post
+       WHERE cmsId = ? AND status = 'publish' ORDER BY publishedAt DESC LIMIT 30`
+    ).bind(cms.id).all();
     return json({ cms, posts });
   }
 
   if (view === 'artikel') {
-    const cms = await env.DB.prepare(`SELECT * FROM cms WHERE kodeCms = ? AND status = 'aktif'`).bind(userSlug).first();
-    if (!cms) return json({ error: `CMS "${userSlug}" tidak ditemukan.` }, 404);
-    const post = await env.DB.prepare(`SELECT * FROM post WHERE cmsId = ? AND slug = ? AND status = 'publish'`).bind(cms.id, postSlug).first();
-    if (!post) return json({ error: `Artikel "${postSlug}" tidak ditemukan atau belum dipublikasikan.` }, 404);
+    const cms = await db.prepare(
+      `SELECT id, kodeCms, nama, bio, avatarUrl FROM cms WHERE kodeCms = ? AND status = 'aktif'`
+    ).bind(userSlug).first();
+    if (!cms) throw new HttpError(404, `CMS "${userSlug}" tidak ditemukan.`);
+    const post = await db.prepare(
+      `SELECT * FROM post WHERE cmsId = ? AND slug = ? AND status = 'publish'`
+    ).bind(cms.id, postSlug).first();
+    if (!post) throw new HttpError(404, `Artikel "${postSlug}" tidak ditemukan atau belum dipublikasikan.`);
 
-    // Hitung view secara best-effort (tidak menghambat response kalau gagal).
-    env.DB.prepare(`UPDATE post SET views = views + 1 WHERE id = ?`).bind(post.id).run().catch(() => {});
+    db.prepare(`UPDATE post SET views = views + 1 WHERE id = ?`).bind(post.id).run().catch(() => {});
 
-    const { results: komentar } = await env.DB
-      .prepare(`SELECT * FROM komentar WHERE postId = ? AND status = 'approved' ORDER BY createdAt ASC LIMIT 200`)
-      .bind(post.id).all();
+    // Sanitasi ulang saat disajikan: melindungi juga baris lama yang
+    // tersimpan sebelum sanitasi sisi-server ini ada.
+    post.konten = sanitizeHtml(post.konten);
+
+    const { results: komentar } = await db.prepare(
+      `SELECT id, postId, nama, isi, createdAt FROM komentar
+       WHERE postId = ? AND status = 'approved' ORDER BY createdAt ASC LIMIT 200`
+    ).bind(post.id).all();
 
     return json({ cms, post, komentar });
   }
 
+  // ---------- LOGIN ----------
+  if (view === 'login' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const kode = String(body.kodeCms || '').trim().toLowerCase();
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+    const ip = clientIp(request);
+
+    await rateLimitCheck(db, `login:ip:${ip}`, { max: 20, windowMs: 15 * 60_000, blockMs: 15 * 60_000 });
+    await rateLimitCheck(db, `login:acc:${kode}:${username}`, { max: 5, windowMs: 15 * 60_000, blockMs: 15 * 60_000 });
+    await verifyTurnstile(env, body.turnstileToken, ip);
+
+    if (!kode || !username || !password) throw new HttpError(400, 'Kode CMS, username, dan password wajib diisi.');
+
+    const cms = await db.prepare(`SELECT * FROM cms WHERE kodeCms = ?`).bind(kode).first();
+    const user = cms
+      ? await db.prepare(`SELECT * FROM users WHERE cmsId = ? AND username = ?`).bind(cms.id, username).first()
+      : null;
+
+    // Selalu jalankan verifikasi (dengan hash dummy kalau user tidak ada)
+    // supaya waktu respons tidak membocorkan username mana yang valid.
+    const ok = await verifyPassword(password, user?.passwordHash || 'pbkdf2$sha256$210000$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+
+    if (!cms || !user || !ok) {
+      await rateLimitHit(db, `login:ip:${ip}`);
+      await rateLimitHit(db, `login:acc:${kode}:${username}`);
+      throw new HttpError(401, 'Kode CMS, username, atau password salah.');
+    }
+    if (cms.status === 'nonaktif') throw new HttpError(403, 'CMS ini sedang dinonaktifkan. Hubungi superadmin.');
+
+    await rateLimitReset(db, `login:acc:${kode}:${username}`);
+    const { token, payload } = await signSession(env, {
+      uid: user.id, cid: cms.id, kode: cms.kodeCms, cmsNama: cms.nama,
+      username: user.username, name: user.name, role: user.role,
+    });
+    return json({ token, expiresAt: payload.exp, user: sessionUserView(payload) });
+  }
+
+  // ---------- REGISTER ----------
+  if (view === 'register' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({}));
+    const ip = clientIp(request);
+    await rateLimitCheck(db, `register:ip:${ip}`, { max: 5, windowMs: 60 * 60_000, blockMs: 60 * 60_000 });
+    await verifyTurnstile(env, body.turnstileToken, ip);
+    await rateLimitHit(db, `register:ip:${ip}`);
+
+    const kode = String(body.kodeCms || '').trim().toLowerCase();
+    const namaCms = String(body.namaCms || '').trim().slice(0, 80);
+    const ownerName = String(body.ownerName || '').trim().slice(0, 80);
+    const username = String(body.username || '').trim();
+    const password = String(body.password || '');
+
+    if (!kode || !namaCms || !ownerName || !username || !password) throw new HttpError(400, 'Semua field bertanda * wajib diisi.');
+    if (!SLUG_RE.test(kode)) throw new HttpError(400, 'Kode CMS harus 2-30 karakter: huruf kecil, angka, atau tanda strip.');
+    if (!USERNAME_RE.test(username)) throw new HttpError(400, 'Username 3-40 karakter: huruf, angka, titik, garis bawah, atau strip.');
+    if (password.length < 8) throw new HttpError(400, 'Password minimal 8 karakter.');
+
+    const existing = await db.prepare(`SELECT id FROM cms WHERE kodeCms = ?`).bind(kode).first();
+    if (existing) throw new HttpError(409, 'Kode CMS sudah dipakai, gunakan kode lain.');
+
+    const now = new Date().toISOString();
+    const cmsRecord = {
+      id: genId('cms'), kodeCms: kode, nama: namaCms,
+      bio: String(body.bio || '').slice(0, 300), avatarUrl: null,
+      status: 'aktif', createdAt: now,
+    };
+    const userRecord = {
+      id: genId('usr'), cmsId: cmsRecord.id, username,
+      passwordHash: await hashPassword(password),
+      name: ownerName, role: 'owner', createdAt: now,
+    };
+    try {
+      await insertRow(db, 'cms', cmsRecord);
+      await insertRow(db, 'users', userRecord);
+    } catch (e) {
+      if (String(e.message).includes('UNIQUE')) throw new HttpError(409, 'Kode CMS atau username sudah dipakai.');
+      throw e;
+    }
+
+    const { token, payload } = await signSession(env, {
+      uid: userRecord.id, cid: cmsRecord.id, kode: cmsRecord.kodeCms, cmsNama: cmsRecord.nama,
+      username: userRecord.username, name: userRecord.name, role: 'owner',
+    });
+    return json({ token, expiresAt: payload.exp, user: sessionUserView(payload) }, 201);
+  }
+
+  // ---------- KOMENTAR (wajib login) ----------
   if (view === 'komentar' && request.method === 'POST') {
-    const cms = await env.DB.prepare(`SELECT * FROM cms WHERE kodeCms = ? AND status = 'aktif'`).bind(userSlug).first();
-    if (!cms) return json({ error: `CMS "${userSlug}" tidak ditemukan.` }, 404);
-    const post = await env.DB.prepare(`SELECT * FROM post WHERE cmsId = ? AND slug = ? AND status = 'publish'`).bind(cms.id, postSlug).first();
-    if (!post) return json({ error: `Artikel "${postSlug}" tidak ditemukan.` }, 404);
+    const session = await requireSession(request, env);
+    await rateLimitCheck(db, `komentar:${session.uid}`, { max: 10, windowMs: 60 * 60_000, blockMs: 15 * 60_000 });
+
+    const cms = await db.prepare(`SELECT id FROM cms WHERE kodeCms = ? AND status = 'aktif'`).bind(userSlug).first();
+    if (!cms) throw new HttpError(404, `CMS "${userSlug}" tidak ditemukan.`);
+    const post = await db.prepare(`SELECT id FROM post WHERE cmsId = ? AND slug = ? AND status = 'publish'`)
+      .bind(cms.id, postSlug).first();
+    if (!post) throw new HttpError(404, `Artikel "${postSlug}" tidak ditemukan.`);
 
     const body = await request.json().catch(() => ({}));
-    const nama = String(body.nama || '').trim().slice(0, 100);
-    const email = String(body.email || '').trim().slice(0, 200);
     const isi = String(body.isi || '').trim().slice(0, 2000);
-    if (!nama || !isi) return json({ error: 'Nama dan komentar wajib diisi.' }, 400);
+    if (!isi) throw new HttpError(400, 'Isi komentar wajib diisi.');
+
+    // Identitas komentator diambil dari TOKEN, bukan dari body request —
+    // `nama`/`userId` yang dikirim klien diabaikan sepenuhnya.
+    const author = await db.prepare(`SELECT name FROM users WHERE id = ?`).bind(session.uid).first();
 
     const komentar = {
       id: genId('komentar'), cmsId: cms.id, postId: post.id,
-      nama, email, isi, status: 'approved', createdAt: new Date().toISOString(),
+      userId: session.uid, nama: author?.name || session.name || 'Pengguna',
+      isi, status: 'approved', createdAt: new Date().toISOString(),
     };
-    const cols = Object.keys(komentar);
-    await env.DB
-      .prepare(`INSERT INTO komentar (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`)
-      .bind(...cols.map(c => komentar[c]))
-      .run();
+    await insertRow(db, 'komentar', komentar);
+    await rateLimitHit(db, `komentar:${session.uid}`);
     return json(komentar, 201);
   }
 
-  return json({ error: `View '${view}' tidak dikenal` }, 400);
+  throw new HttpError(400, `View '${view}' tidak dikenal`);
+}
+
+/** Bentuk objek sesi yang dikirim ke frontend — tanpa hash/kredensial apa pun. */
+function sessionUserView(p) {
+  return {
+    cmsId: p.cid, cmsNama: p.cmsNama, cmsKode: p.kode,
+    userId: p.uid, username: p.username, name: p.name, role: p.role,
+  };
 }
 
 // ============================================================
-// Entry point — cuma 2 permukaan: /api dan /public. Tidak ada lagi
-// fallback ke static assets atau SSR path-based (lihat catatan atas).
+// Entry point
 // ============================================================
 export default {
   async fetch(request, env) {
+    const cors = corsHeaders(request, env);
     const url = new URL(request.url);
 
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        },
-      });
-    }
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
 
     try {
-      if (url.pathname === '/api') return await handleApi(request, env);
-      if (url.pathname === '/public') return await handlePublic(request, env);
+      if (url.pathname === '/api') {
+        const res = await handleApi(request, env);
+        return withHeaders(res, cors);
+      }
+      if (url.pathname === '/public') {
+        const res = await handlePublic(request, env);
+        return withHeaders(res, cors);
+      }
     } catch (err) {
-      return json({ error: err.message }, 500);
+      if (err instanceof HttpError) return withHeaders(json({ error: err.message }, err.status), cors);
+      // Pesan error internal TIDAK dibocorkan ke klien (bisa memuat SQL/struktur DB).
+      console.error('cms-api error:', err?.stack || err);
+      return withHeaders(json({ error: 'Terjadi kesalahan di server.' }, 500), cors);
     }
 
-    return json({ error: 'Not found. Gunakan /api?table=... atau /public?view=...' }, 404);
+    return withHeaders(json({ error: 'Not found. Gunakan /api?table=... atau /public?view=...' }, 404), cors);
   },
+};
+
+function withHeaders(res, headers) {
+  const out = new Response(res.body, res);
+  for (const [k, v] of Object.entries(headers)) out.headers.set(k, v);
+  return out;
+}
+
+// Diekspor untuk keperluan pengujian (tidak memengaruhi runtime Worker).
+export const __test__ = {
+  hashPassword, verifyPassword, signSession, verifySession,
+  sanitizeHtml, safeUrl, rateLimitCheck, rateLimitHit, pickColumns,
 };
