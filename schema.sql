@@ -103,8 +103,9 @@ CREATE TABLE rate_limit (
 
 -- ============================================================
 -- SEED DATA DEMO
--- Password di bawah sudah DALAM BENTUK HASH PBKDF2-SHA256 (210.000
--- iterasi). Plaintext-nya hanya untuk demo lokal — GANTI SEBELUM
+-- Password di bawah sudah DALAM BENTUK HASH PBKDF2-SHA256 (100.000
+-- iterasi — batas maksimal yang didukung WebCrypto Cloudflare Workers).
+-- Plaintext-nya hanya untuk demo lokal — GANTI SEBELUM
 -- PRODUKSI, dan hapus baris demo ini di lingkungan sungguhan.
 --   superadmin / Sup3rAdmin!2026
 --   wawan      / Wawan!Demo2026
@@ -115,8 +116,8 @@ INSERT INTO cms (id, kodeCms, nama, bio, avatarUrl, status, createdAt) VALUES
  ('cms_demo', 'wawan',      'Wawan', 'Pracademic — praktisi & akademisi. Menulis soal software, riset, dan hal-hal di antaranya.', NULL, 'aktif', datetime('now'));
 
 INSERT INTO users (id, cmsId, username, passwordHash, name, role, createdAt) VALUES
- ('usr_super', 'system',   'superadmin', 'pbkdf2$sha256$210000$NSeNiBiTZEkegdcC_-lt2A$ROQs_ZWj_SNt05odGonFCHBPmI2brAl7zbaWHw40T3w', 'Super Admin', 'superadmin', datetime('now')),
- ('usr_owner', 'cms_demo', 'wawan',      'pbkdf2$sha256$210000$atb9KvJHBxPuCQiy-Lygfw$shE364jPVWpB2X_972M0fQZ5P64TqYgE_kORfaTTrks',      'Wawan',       'owner',      datetime('now'));
+ ('usr_super', 'system',   'superadmin', 'pbkdf2$sha256$100000$oYpuW3kiXWshL5LW3AtR2Q$MBRtyakD2M8_6YZ4GDgOwXDCrW9rCpWcpIy4Gvrm-Sk', 'Super Admin', 'superadmin', datetime('now')),
+ ('usr_owner', 'cms_demo', 'wawan',      'pbkdf2$sha256$100000$cDzAvxJlnyReoWcKbPyw-Q$3N-07IxVjQ43SOSbMjQc3o7be_0OR_tpipp7akIdsUc',      'Wawan',       'owner',      datetime('now'));
 
 INSERT INTO post (id, cmsId, slug, judul, ringkasan, konten, kategori, tags, status, views, publishedAt, createdAt, updatedAt) VALUES
  ('pst_1', 'cms_demo', 'selamat-datang',
