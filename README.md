@@ -144,7 +144,10 @@ Cloudflare Pages / Netlify) — tidak ada aturan rewrite yang perlu diatur.
 - `GET /public?view=home` — daftar CMS aktif.
 - `GET /public?view=profile&user=<kodeCms>` — profil + daftar artikel publish.
 - `GET /public?view=artikel&user=<kodeCms>&slug=<slug>` — artikel + komentar.
-- `POST /public?view=komentar&user=<kodeCms>&slug=<slug>` — kirim komentar.
+- `GET /public?view=captcha` — soal captcha matematika baru (`{challenge, token}`), panggil sebelum login/registrasi.
+- `POST /public?view=login` — `{kodeCms,username,password,captchaToken,captchaAnswer}` → `{token,expiresAt,user}`.
+- `POST /public?view=register` — `{kodeCms,namaCms,bio,ownerName,username,password,captchaToken,captchaAnswer}` → `{token,expiresAt,user}`.
+- `POST /public?view=komentar&user=<kodeCms>&slug=<slug>` — kirim komentar (butuh Bearer token).
 
 Catatan: endpoint backend TIDAK ikut memakai bentuk "rapi" seperti URL
 publik frontend. Backend adalah kontrak API antar-layanan — `view=profile`

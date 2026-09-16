@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import worker, { __test__ } from '../out/cms-api-secured/worker.js';
+import worker, { __test__ } from './worker.js';
 import { makeD1 } from './d1shim.mjs';
 
 let pass = 0, fail = 0;
@@ -9,7 +9,7 @@ function ok(name, cond, extra = '') {
 }
 
 // ---- siapkan DB dengan seed ter-hash ----
-let schema = fs.readFileSync(new URL('../out/cms-api-secured/schema.sql', import.meta.url), 'utf8');
+let schema = fs.readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
 const hSuper = await __test__.hashPassword('Sup3rAdmin!2026');
 const hWawan = await __test__.hashPassword('Wawan!Demo2026');
 schema = schema.replace('__HASH_SUPERADMIN__', hSuper).replace('__HASH_WAWAN__', hWawan);
@@ -17,18 +17,7 @@ schema = schema.replace('__HASH_SUPERADMIN__', hSuper).replace('__HASH_WAWAN__',
 const env = {
   DB: makeD1(schema),
   SESSION_SECRET: 'x'.repeat(48),
-  TURNSTILE_SECRET_KEY: 'dummy-secret',
   ALLOWED_ORIGINS: 'https://cms.piawai.id',
-};
-
-// mock siteverify: token 'good' sukses, lainnya gagal
-const realFetch = globalThis.fetch;
-globalThis.fetch = async (url, init) => {
-  if (String(url).includes('siteverify')) {
-    const resp = init.body.get('response');
-    return new Response(JSON.stringify({ success: resp === 'good' }), { headers: { 'Content-Type': 'application/json' } });
-  }
-  return realFetch(url, init);
 };
 
 const ORIGIN = 'https://cms.piawai.id';
@@ -47,6 +36,15 @@ const call = async (...a) => {
   return { status: res.status, data, headers: res.headers };
 };
 
+/** Ambil soal captcha sungguhan dari server (seperti klien nyata) dan hitung
+ *  jawaban yang benar, supaya test memverifikasi alur end-to-end (bukan mock). */
+async function getCaptcha(ip = '1.2.3.4') {
+  const r = await call('/public?view=captcha', { ip });
+  const m = String(r.data?.challenge || '').match(/^(\d+)\s*\+\s*(\d+)\s*=\s*\?$/);
+  if (!m) throw new Error(`Format soal captcha tak dikenali: ${JSON.stringify(r.data)}`);
+  return { token: r.data.token, answer: Number(m[1]) + Number(m[2]) };
+}
+
 console.log('\n== 1. Hashing password ==');
 ok('hash tidak memuat plaintext', !hWawan.includes('Wawan!Demo2026'));
 ok('verify password benar', await __test__.verifyPassword('Wawan!Demo2026', hWawan));
@@ -59,16 +57,47 @@ let r = await call('/api?table=users&cmsId=cms_demo');
 ok('GET users tanpa token -> 401', r.status === 401, JSON.stringify(r.data));
 
 console.log('\n== 3. Login ==');
-r = await call('/public?view=login', { method: 'POST', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', turnstileToken: 'bad' } });
-ok('captcha gagal -> 400', r.status === 400, JSON.stringify(r.data));
+let cap = await getCaptcha('3.3.3.1');
+r = await call('/public?view=login', { method: 'POST', ip: '3.3.3.1', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: cap.token, captchaAnswer: cap.answer + 1 } });
+ok('jawaban captcha salah -> 400', r.status === 400, JSON.stringify(r.data));
 
-r = await call('/public?view=login', { method: 'POST', body: { kodeCms: 'wawan', username: 'wawan', password: 'salah', turnstileToken: 'good' } });
+cap = await getCaptcha('3.3.3.2');
+r = await call('/public?view=login', { method: 'POST', ip: '3.3.3.2', body: { kodeCms: 'wawan', username: 'wawan', password: 'salah', captchaToken: cap.token, captchaAnswer: cap.answer } });
 ok('password salah -> 401', r.status === 401);
 
-r = await call('/public?view=login', { method: 'POST', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', turnstileToken: 'good' } });
+cap = await getCaptcha('3.3.3.3');
+r = await call('/public?view=login', { method: 'POST', ip: '3.3.3.3', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: cap.token, captchaAnswer: cap.answer } });
 ok('login benar -> 200 + token', r.status === 200 && !!r.data.token, JSON.stringify(r.data));
 ok('respons login tidak memuat hash/password', !JSON.stringify(r.data).match(/pbkdf2|password/i), JSON.stringify(r.data));
 const tokenWawan = r.data.token;
+
+console.log('\n== 3b. Captcha matematika — kasus tambahan ==');
+cap = await getCaptcha('3.3.3.4');
+r = await call('/public?view=login', { method: 'POST', ip: '3.3.3.4', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: cap.token, captchaAnswer: cap.answer } });
+ok('login sukses dengan captcha benar (kredensial valid)', r.status === 200 && !!r.data.token, JSON.stringify(r.data));
+
+r = await call('/public?view=login', { method: 'POST', ip: '3.3.3.5', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: 'token-ngawur', captchaAnswer: 5 } });
+ok('token captcha rusak/tidak dikenal -> 400', r.status === 400, JSON.stringify(r.data));
+
+// Token sesi (typ:'session') tidak boleh diterima sebagai token captcha,
+// walau tanda tangannya sah — ini menguji pemisahan `typ` di verifyToken.
+r = await call('/public?view=login', { method: 'POST', ip: '3.3.3.6', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: tokenWawan, captchaAnswer: 5 } });
+ok('token sesi ditolak sebagai token captcha (typ tidak cocok)', r.status === 400, JSON.stringify(r.data));
+
+console.log('\n== 3c. Batas percobaan captcha (per-IP) ==');
+let capLockStatus = 0;
+const lockIp = '3.3.3.9';
+for (let i = 0; i < 11; i++) {
+  const c = await getCaptcha(lockIp);
+  const rr = await call('/public?view=login', { method: 'POST', ip: lockIp, body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: c.token, captchaAnswer: c.answer + 1 } });
+  capLockStatus = rr.status;
+}
+ok('setelah 10+ jawaban captcha salah dari IP sama -> 429 (terkunci)', capLockStatus === 429, `status terakhir ${capLockStatus}`);
+const capAfterLock = await getCaptcha(lockIp).catch(() => null);
+r = capAfterLock
+  ? await call('/public?view=login', { method: 'POST', ip: lockIp, body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: capAfterLock.token, captchaAnswer: capAfterLock.answer } })
+  : { status: 429 };
+ok('captcha benar pun tetap ditolak selama IP terkunci', r.status === 429, JSON.stringify(r.data));
 
 r = await call('/api?table=users', { token: tokenWawan });
 ok('GET users dengan token valid -> 403 (tetap diblokir)', r.status === 403, JSON.stringify(r.data));
@@ -76,12 +105,14 @@ r = await call('/api?table=komentar', { token: tokenWawan });
 ok('GET komentar lewat /api -> 403', r.status === 403);
 
 console.log('\n== 4. Registrasi + isolasi CMS (IDOR) ==');
+cap = await getCaptcha('9.9.9.9');
 r = await call('/public?view=register', { method: 'POST', ip: '9.9.9.9', body: {
-  kodeCms: 'siti', namaCms: 'Catatan Siti', ownerName: 'Siti', username: 'siti', password: 'pendek', turnstileToken: 'good' } });
+  kodeCms: 'siti', namaCms: 'Catatan Siti', ownerName: 'Siti', username: 'siti', password: 'pendek', captchaToken: cap.token, captchaAnswer: cap.answer } });
 ok('password < 8 karakter ditolak', r.status === 400, JSON.stringify(r.data));
 
+cap = await getCaptcha('9.9.9.9');
 r = await call('/public?view=register', { method: 'POST', ip: '9.9.9.9', body: {
-  kodeCms: 'siti', namaCms: 'Catatan Siti', ownerName: 'Siti', username: 'siti', password: 'SitiRahasia9', turnstileToken: 'good' } });
+  kodeCms: 'siti', namaCms: 'Catatan Siti', ownerName: 'Siti', username: 'siti', password: 'SitiRahasia9', captchaToken: cap.token, captchaAnswer: cap.answer } });
 ok('registrasi sukses -> 201 + token', r.status === 201 && !!r.data.token, JSON.stringify(r.data));
 const tokenSiti = r.data.token;
 const cmsIdSiti = r.data.user.cmsId;
@@ -160,11 +191,13 @@ ok('userId diambil dari token', r.data?.userId !== 'usr_super');
 console.log('\n== 9. Rate limit login ==');
 let lastStatus = 0;
 for (let i = 0; i < 8; i++) {
-  const rr = await call('/public?view=login', { method: 'POST', ip: '5.5.5.5', body: { kodeCms: 'wawan', username: 'wawan', password: 'salah-terus', turnstileToken: 'good' } });
+  const c = await getCaptcha('5.5.5.5');
+  const rr = await call('/public?view=login', { method: 'POST', ip: '5.5.5.5', body: { kodeCms: 'wawan', username: 'wawan', password: 'salah-terus', captchaToken: c.token, captchaAnswer: c.answer } });
   lastStatus = rr.status;
 }
 ok('setelah beberapa percobaan gagal -> 429 (terkunci)', lastStatus === 429, `status terakhir ${lastStatus}`);
-r = await call('/public?view=login', { method: 'POST', ip: '5.5.5.5', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', turnstileToken: 'good' } });
+const capFinal = await getCaptcha('5.5.5.5');
+r = await call('/public?view=login', { method: 'POST', ip: '5.5.5.5', body: { kodeCms: 'wawan', username: 'wawan', password: 'Wawan!Demo2026', captchaToken: capFinal.token, captchaAnswer: capFinal.answer } });
 ok('password benar pun tetap ditolak selama terkunci', r.status === 429);
 
 console.log('\n== 10. CORS ==');

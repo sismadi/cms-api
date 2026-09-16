@@ -13,10 +13,17 @@
 //     Keduanya diturunkan dari token sesi HMAC-SHA256 yang
 //     diverifikasi di server (header `Authorization: Bearer <token>`).
 //     Parameter `cmsId` di query string diabaikan sepenuhnya.
-//  4. Turnstile diverifikasi di server lewat `siteverify` sebelum
-//     login/registrasi diproses.
+//  4. Captcha matematika kustom (mis. "4 + 7 = ?") diverifikasi di
+//     server sebelum login/registrasi diproses — soal + jawaban
+//     ditandatangani HMAC (typ:'captcha', lihat signToken/verifyToken),
+//     jadi tidak perlu tabel/state baru. Menggantikan Cloudflare
+//     Turnstile: tanpa dependensi pihak ketiga, tanpa script eksternal
+//     yang bisa diblokir ad-blocker, tanpa secret tambahan (reuse
+//     SESSION_SECRET). Percobaan jawaban salah dibatasi lewat
+//     `rate_limit` yang sama seperti poin 5.
 //  5. Rate limiting nyata di D1 (tabel `rate_limit`): per-IP dan
-//     per-akun untuk login/registrasi, per-user untuk komentar.
+//     per-akun untuk login/registrasi, per-user untuk komentar, per-IP
+//     untuk percobaan captcha.
 //  6. `post.konten` di-sanitize di server (allowlist) saat disimpan
 //     DAN saat disajikan lewat /public — jadi konsumen API lain
 //     (mobile app, integrasi pihak ketiga) ikut terlindungi.
@@ -27,7 +34,6 @@
 //
 // Secret/variable yang WAJIB di-set (lihat README.md):
 //   wrangler secret put SESSION_SECRET
-//   wrangler secret put TURNSTILE_SECRET_KEY
 //   (opsional) vars ALLOWED_ORIGINS = "https://cms.piawai.id"
 // ============================================================
 
@@ -159,9 +165,17 @@ async function verifyPassword(password, stored) {
 }
 
 // ------------------------------------------------------------
-// [KRITIS #2] Token sesi — HMAC-SHA256 bertanda tangan server.
-// Payload: { uid, cid, kode, cmsNama, username, name, role, iat, exp }
-// cmsId & role SELALU dibaca dari sini, tidak pernah dari klien.
+// [KRITIS #2] Token bertanda tangan server — HMAC-SHA256, generik.
+// `typ` membedakan jenis token (mis. 'session' vs 'captcha') supaya
+// satu jenis token TIDAK BISA dipakai ulang sebagai jenis lain walau
+// tanda tangannya sah (mis. token captcha kedaluwarsa-pendek yang
+// disodorkan sebagai token sesi) — signature valid tidak cukup, `typ`
+// harus cocok dengan yang diminta pemanggil.
+//
+// Token sesi: payload { typ:'session', uid, cid, kode, cmsNama,
+// username, name, role, iat, exp }. cmsId & role SELALU dibaca dari
+// sini, tidak pernah dari klien.
+// Token captcha: payload { typ:'captcha', a, b, iat, exp }.
 // ------------------------------------------------------------
 async function hmacKey(env) {
   const secret = env.SESSION_SECRET;
@@ -171,14 +185,14 @@ async function hmacKey(env) {
   return crypto.subtle.importKey('raw', enc.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
 }
 
-async function signSession(env, payload) {
-  const body = { ...payload, iat: Date.now(), exp: Date.now() + SESSION_TTL_MS };
+async function signToken(env, typ, payload, ttlMs) {
+  const body = { ...payload, typ, iat: Date.now(), exp: Date.now() + ttlMs };
   const data = b64urlEncode(enc.encode(JSON.stringify(body)));
   const sig = await crypto.subtle.sign('HMAC', await hmacKey(env), enc.encode(data));
   return { token: `${data}.${b64urlEncode(sig)}`, payload: body };
 }
 
-async function verifySession(env, token) {
+async function verifyToken(env, typ, token) {
   if (!token || typeof token !== 'string' || !token.includes('.')) return null;
   const [data, sig] = token.split('.');
   let expected;
@@ -191,7 +205,16 @@ async function verifySession(env, token) {
   let payload;
   try { payload = JSON.parse(new TextDecoder().decode(b64urlDecode(data))); } catch (e) { return null; }
   if (!payload?.exp || Date.now() > payload.exp) return null;
+  if (payload.typ !== typ) return null; // token jenis lain (mis. captcha) tidak sah sebagai sesi, atau sebaliknya
   return payload;
+}
+
+async function signSession(env, payload) {
+  return signToken(env, 'session', payload, SESSION_TTL_MS);
+}
+
+async function verifySession(env, token) {
+  return verifyToken(env, 'session', token);
 }
 
 /** Ambil sesi dari header Authorization; lempar 401 kalau tidak sah. */
@@ -204,27 +227,54 @@ async function requireSession(request, env) {
 }
 
 // ------------------------------------------------------------
-// [TINGGI #3] Verifikasi Turnstile di server.
-// Fail-closed: kalau secret belum di-set, permintaan ditolak — supaya
-// tidak ada mode "seolah-olah ada captcha" yang sebenarnya kosong.
+// [TINGGI #3] Captcha matematika kustom, diverifikasi di server.
+// Menggantikan Cloudflare Turnstile: tidak ada dependensi pihak
+// ketiga, tidak ada script eksternal yang bisa ter-block ad-blocker,
+// tidak ada secret tambahan yang perlu di-set.
+//
+// Soalnya ("a + b = ?") DAN jawabannya (a, b) ditandatangani HMAC di
+// `token` (typ:'captcha', lihat signToken/verifyToken) lalu dikirim
+// ke klien — klien tidak pernah tahu jawabannya dari token itu sendiri
+// (token cuma bisa diverifikasi ulang, bukan dibaca isinya tanpa
+// tanda tangan yang valid diverifikasi server), jadi harus benar-benar
+// menjumlahkan untuk lolos. Token kedaluwarsa pendek (lihat
+// CAPTCHA_TTL_MS) supaya soal tidak bisa "disimpan" lalu dipakai
+// berkali-kali dalam jangka panjang.
+//
+// Ini BUKAN pertahanan anti-bot yang kuat (bot sederhana pun bisa
+// mem-parsing "a + b = ?" dan menjumlahkannya) — tujuannya sama seperti
+// captcha matematika pada umumnya: menyaring form-spam otomatis yang
+// generik, bukan menghentikan penyerang yang menargetkan aplikasi ini
+// secara spesifik. Fail-closed tetap dipertahankan lewat
+// `hmacKey()`/`SESSION_SECRET` (kalau kosong, seluruh alur token —
+// termasuk captcha — otomatis gagal).
 // ------------------------------------------------------------
-async function verifyTurnstile(env, token, ip) {
-  if (!env.TURNSTILE_SECRET_KEY) {
-    throw new HttpError(500, 'Server belum dikonfigurasi (TURNSTILE_SECRET_KEY kosong).');
+const CAPTCHA_TTL_MS = 5 * 60 * 1000; // 5 menit — cukup untuk mengisi form, tidak untuk disimpan lama
+
+async function generateMathCaptcha(env) {
+  const a = 1 + Math.floor(Math.random() * 9); // 1..9
+  const b = 1 + Math.floor(Math.random() * 9); // 1..9
+  const { token } = await signToken(env, 'captcha', { a, b }, CAPTCHA_TTL_MS);
+  return { challenge: `${a} + ${b} = ?`, token };
+}
+
+/**
+ * Verifikasi jawaban captcha. Percobaan (benar maupun salah, sama
+ * seperti login) dibatasi per-IP lewat `rate_limit` yang sama dipakai
+ * untuk login/registrasi — jadi tidak perlu tabel/infra baru.
+ */
+async function verifyMathCaptcha(env, db, token, answer, ip) {
+  const key = `captcha:ip:${ip}`;
+  await rateLimitCheck(db, key, { max: 10, windowMs: 15 * 60_000, blockMs: 15 * 60_000 });
+
+  const payload = await verifyToken(env, 'captcha', token);
+  const given = Number(answer);
+  const correct = payload && Number.isFinite(given) && (payload.a + payload.b) === given;
+
+  if (!correct) {
+    await rateLimitHit(db, key);
+    throw new HttpError(400, 'Jawaban captcha salah atau soal sudah kedaluwarsa. Muat ulang soal dan coba lagi.');
   }
-  if (!token) throw new HttpError(400, 'Verifikasi captcha wajib diselesaikan.');
-  const form = new FormData();
-  form.append('secret', env.TURNSTILE_SECRET_KEY);
-  form.append('response', token);
-  if (ip && ip !== 'unknown') form.append('remoteip', ip);
-  let result;
-  try {
-    const res = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', { method: 'POST', body: form });
-    result = await res.json();
-  } catch (e) {
-    throw new HttpError(503, 'Gagal memverifikasi captcha, coba lagi sebentar lagi.');
-  }
-  if (!result?.success) throw new HttpError(400, 'Verifikasi captcha gagal. Muat ulang halaman dan coba lagi.');
 }
 
 // ------------------------------------------------------------
@@ -556,8 +606,9 @@ async function handleApi(request, env) {
 //   GET  /public?view=home
 //   GET  /public?view=profile&user=<kodeCms>
 //   GET  /public?view=artikel&user=<kodeCms>&slug=<slug>
-//   POST /public?view=login      body:{kodeCms,username,password,turnstileToken}
-//   POST /public?view=register   body:{kodeCms,namaCms,bio,ownerName,username,password,turnstileToken}
+//   GET  /public?view=captcha    -> {challenge, token} — panggil sebelum login/registrasi
+//   POST /public?view=login      body:{kodeCms,username,password,captchaToken,captchaAnswer}
+//   POST /public?view=register   body:{kodeCms,namaCms,bio,ownerName,username,password,captchaToken,captchaAnswer}
 //   POST /public?view=komentar&user=<kodeCms>&slug=<slug>  body:{isi}  + Bearer token
 // ------------------------------------------------------------
 async function handlePublic(request, env) {
@@ -566,6 +617,10 @@ async function handlePublic(request, env) {
   const userSlug = (url.searchParams.get('user') || '').toLowerCase();
   const postSlug = url.searchParams.get('slug') || '';
   const db = env.DB;
+
+  if (view === 'captcha') {
+    return json(await generateMathCaptcha(env));
+  }
 
   if (view === 'home') {
     const { results } = await db.prepare(
@@ -620,7 +675,7 @@ async function handlePublic(request, env) {
 
     await rateLimitCheck(db, `login:ip:${ip}`, { max: 20, windowMs: 15 * 60_000, blockMs: 15 * 60_000 });
     await rateLimitCheck(db, `login:acc:${kode}:${username}`, { max: 5, windowMs: 15 * 60_000, blockMs: 15 * 60_000 });
-    await verifyTurnstile(env, body.turnstileToken, ip);
+    await verifyMathCaptcha(env, db, body.captchaToken, body.captchaAnswer, ip);
 
     if (!kode || !username || !password) throw new HttpError(400, 'Kode CMS, username, dan password wajib diisi.');
 
@@ -653,7 +708,7 @@ async function handlePublic(request, env) {
     const body = await request.json().catch(() => ({}));
     const ip = clientIp(request);
     await rateLimitCheck(db, `register:ip:${ip}`, { max: 5, windowMs: 60 * 60_000, blockMs: 60 * 60_000 });
-    await verifyTurnstile(env, body.turnstileToken, ip);
+    await verifyMathCaptcha(env, db, body.captchaToken, body.captchaAnswer, ip);
     await rateLimitHit(db, `register:ip:${ip}`);
 
     const kode = String(body.kodeCms || '').trim().toLowerCase();
@@ -775,5 +830,6 @@ function withHeaders(res, headers) {
 // Diekspor untuk keperluan pengujian (tidak memengaruhi runtime Worker).
 export const __test__ = {
   hashPassword, verifyPassword, signSession, verifySession,
+  signToken, verifyToken, generateMathCaptcha, verifyMathCaptcha,
   sanitizeHtml, safeUrl, rateLimitCheck, rateLimitHit, pickColumns,
 };

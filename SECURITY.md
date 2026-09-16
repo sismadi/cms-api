@@ -15,8 +15,9 @@ fungsional (bukan sekadar cek sintaks) terhadap D1 in-memory.
    total dari `/api`; tidak ada endpoint yang mengembalikan `passwordHash`.
 3. **Allowlist, bukan blocklist** — untuk tag HTML, atribut, skema URL,
    nama tabel, dan nama kolom yang boleh ditulis.
-4. **Fail-closed.** Kalau `SESSION_SECRET` atau `TURNSTILE_SECRET_KEY`
-   belum di-set, permintaan ditolak — bukan jalan tanpa proteksi.
+4. **Fail-closed.** Kalau `SESSION_SECRET` belum di-set (atau terlalu
+   pendek), permintaan ditolak — termasuk captcha, yang memakai secret
+   yang sama untuk menandatangani soalnya (lihat `signToken`).
 5. **Pesan error tidak membocorkan internal.** Hanya `HttpError` yang
    pesannya sampai ke klien; error lain jadi "Terjadi kesalahan di server."
    dan hanya masuk log Worker.
@@ -34,7 +35,7 @@ audit berikutnya tidak perlu menafsir ulang tiap kali.
 | 2 | Allowlist, bukan blocklist, untuk HTML mentah | **Berlaku langsung** | `ALLOWED_TAGS` + `safeUrl()` (tolak semua skema URL kecuali `http/https/mailto` eksplisit) |
 | 3 | Raw HTML harus eksplisit & sempit (`rawKeys`, `type:'raw'`) | **Tidak berlaku** — backend tidak pernah mengeluarkan penanda "field ini boleh HTML mentah"; satu-satunya field HTML (`post.konten`) SELALU lewat `sanitizeHtml()`, tidak ada jalur raw sama sekali | Padanan yang backend memang punya: `WRITABLE_COLUMNS` — allowlist eksplisit & sempit untuk *field mana saja* yang boleh ditulis klien per tabel, sisanya dibuang oleh `pickColumns()` |
 | 4 | Jangan percaya klien untuk otorisasi; verifikasi dari token sesi | **Berlaku langsung, ini rumah aturannya** | `cmsId`/`role` selalu dari `requireSession()` (HMAC terverifikasi), bukan query string |
-| 5 | Captcha hanya berarti kalau diverifikasi server | **Berlaku langsung, ini rumah aturannya** | `verifyTurnstile()` + fail-closed kalau secret kosong |
+| 5 | Captcha hanya berarti kalau diverifikasi server | **Berlaku langsung, ini rumah aturannya** | `verifyMathCaptcha()` — soal+jawaban ditandatangani HMAC (`typ:'captcha'`), diverifikasi ulang di server; fail-closed kalau `SESSION_SECRET` kosong |
 | 6 | Kredensial tidak pernah bentuk yang bisa dibaca ulang | **Berlaku langsung, ini rumah aturannya** | PBKDF2-SHA256 + salt, `verifyPassword()` waktu-konstan, tidak ada endpoint yang mengembalikan hash |
 
 Ringkasnya: #4, #5, #6 memang ditujukan untuk backend dan dipenuhi apa
@@ -52,7 +53,7 @@ merender, backend saat menyimpan & menyajikan) sebagai lapisan berlapis.
 | KRITIS 1 | `GET /api?table=users&cmsId=X` mengembalikan username + password semua pengguna satu CMS, tanpa perlu login | `users` & `komentar` masuk `BLOCKED_TABLES` → `403` apa pun tokennya. Autentikasi pindah ke `POST /public?view=login` yang mencocokkan di server dan hanya mengembalikan token + data tampilan |
 | KRITIS 1b | Password plaintext di database | `users.passwordHash` — PBKDF2-SHA256, salt 16 byte per user, 210.000 iterasi (rekomendasi OWASP untuk SHA-256; Argon2id tidak tersedia native di runtime Workers), dibandingkan secara waktu-konstan |
 | KRITIS 2 | IDOR: `cmsId` diambil dari `localStorage` klien, backend memercayainya | `cmsId` selalu dari `session.cid` (token). Diuji: akun "wawan" memalsukan `cmsId` milik "siti" di query → daftar artikel tetap kosong, GET by id `404`, DELETE tidak menghapus apa pun |
-| TINGGI 3 | Turnstile hanya widget frontend, tidak diverifikasi | `verifyTurnstile()` memanggil `siteverify` (dengan `remoteip`) sebelum kredensial diproses, di login maupun registrasi |
+| TINGGI 3 | Captcha hanya widget frontend, tidak diverifikasi | `verifyMathCaptcha()` memverifikasi soal+jawaban bertanda tangan server sebelum kredensial diproses, di login maupun registrasi — lihat "Perubahan arsitektur captcha" di bawah |
 | TINGGI 4 | Lockout login cuma di frontend (kosmetik) | Tabel `rate_limit` di D1: login 5 gagal/akun & 20/IP per 15 menit → blokir 15 menit; registrasi 5/IP per jam; komentar 10/user per jam. Blokir ditegakkan **sebelum** password dicocokkan, jadi password benar pun ditolak selama terkunci |
 | SEDANG 5 | Sanitasi HTML hanya di frontend | `sanitizeHtml()` server-side (allowlist tag+atribut, buang `on*`, tolak skema `javascript:`/`data:`/`vbscript:` termasuk yang ter-encode entity) dipanggil saat **menyimpan** dan saat **menyajikan** lewat `/public` — baris lama yang terlanjur kotor ikut bersih saat dibaca |
 | Tambahan | `INSERT INTO ${table} (${Object.keys(body)})` merakit **nama kolom** dari body klien — injeksi SQL lewat nama kolom | `WRITABLE_COLUMNS` per tabel; `pickColumns()` membuang sisanya. `id`, `cmsId`, `views` selalu ditentukan server |
@@ -61,6 +62,31 @@ merender, backend saat menyimpan & menyajikan) sebagai lapisan berlapis.
 | Tambahan | Komentar bisa dipalsukan identitasnya | `nama` & `userId` diambil dari token + tabel `users`; field `nama`/`userId` di body diabaikan. Kolom `email` bebas-ketik dihapus dari skema |
 | Tambahan | `post.status`, `slug`, URL cover tidak divalidasi | `status` dipaksa ke `draft|publish`, `slug` wajib lolos `SLUG_RE`, `coverImage`/`avatarUrl` lewat `safeUrl()`, semua teks dipotong panjang maksimum |
 | Tambahan | Pemilik CMS bisa menyunting field administratif | Owner hanya boleh `nama`, `bio`, `avatarUrl`. `status` khusus superadmin; `kodeCms` tidak bisa diubah siapa pun lewat PATCH (tautan publik tidak boleh patah) |
+
+## Perubahan arsitektur captcha (Turnstile → matematika kustom)
+
+Versi sebelumnya memverifikasi captcha lewat Cloudflare Turnstile
+(`verifyTurnstile()` memanggil `siteverify`). Diganti dengan captcha
+matematika kustom (`generateMathCaptcha()`/`verifyMathCaptcha()`) karena:
+
+- **Tanpa dependensi pihak ketiga.** Tidak ada panggilan keluar ke
+  `challenges.cloudflare.com` dari server maupun klien, dan tidak ada
+  script eksternal (`turnstile/v0/api.js`) di frontend yang bisa
+  ter-block ad-blocker atau gagal dimuat.
+- **Tanpa secret tambahan.** Soal ("a + b = ?") dan jawabannya
+  ditandatangani HMAC dengan `SESSION_SECRET` yang sudah ada
+  (`signToken`/`verifyToken`, `typ:'captcha'`) — tidak perlu
+  `TURNSTILE_SECRET_KEY` maupun tabel/state baru.
+- **Percobaan dibatasi** lewat `rate_limit` yang sama dipakai
+  login/registrasi (kunci `captcha:ip:<ip>`, maks 10 percobaan/15
+  menit lalu terkunci 15 menit) — bukan cuma diverifikasi sekali tanpa
+  batas percobaan.
+- **Kesadaran keterbatasan:** ini captcha matematika sederhana, bukan
+  pertahanan anti-bot canggih seperti Turnstile (tidak ada analisis
+  perilaku/fingerprint). Cukup untuk menyaring form-spam otomatis
+  generik; bukan untuk melawan penyerang yang menargetkan aplikasi ini
+  secara spesifik. Trade-off ini diterima sadar demi menghilangkan
+  ketergantungan pihak ketiga.
 
 ## Batas yang masih ada (sadar, bukan kelupaan)
 

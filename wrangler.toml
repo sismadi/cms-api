@@ -25,14 +25,12 @@ ALLOWED_ORIGINS = "https://cms.piawai.id"
 #
 #   wrangler secret put SESSION_SECRET
 #     -> string acak panjang (min. 32 karakter). Kunci HMAC untuk
-#        menandatangani token sesi. Kalau diganti, semua sesi yang
+#        menandatangani token sesi DAN token captcha matematika (lihat
+#        signToken/verifyToken di worker.js — tidak perlu secret
+#        terpisah untuk captcha). Kalau diganti, semua sesi yang
 #        sedang berjalan otomatis invalid (itu cara mencabut sesi massal).
 #        Membuat nilainya:  openssl rand -base64 48
 #
-#   wrangler secret put TURNSTILE_SECRET_KEY
-#     -> Secret Key dari dashboard Cloudflare Turnstile. Site Key-nya
-#        (yang boleh publik) ditempel di cms-app/auth.js.
-#
-# Worker menolak login/registrasi kalau salah satu secret ini belum ada
+# Worker menolak login/registrasi kalau secret ini belum ada
 # (fail-closed) — bukan diam-diam berjalan tanpa captcha.
 # ------------------------------------------------------------
