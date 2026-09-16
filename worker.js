@@ -41,7 +41,12 @@
 // Konfigurasi
 // ------------------------------------------------------------
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;      // 12 jam
-const PBKDF2_ITERATIONS = 210_000;
+// Runtime Cloudflare Workers (WebCrypto) MEMBATASI PBKDF2 maksimal
+// 100.000 iterasi (di atas itu subtle.deriveBits melempar
+// NotSupportedError). 210.000 adalah rekomendasi OWASP untuk server
+// Node biasa, tapi tidak didukung di Workers — pakai batas maksimal
+// yang didukung Workers sebagai gantinya.
+const PBKDF2_ITERATIONS = 100_000;
 const SLUG_RE = /^[a-z0-9][a-z0-9-]{1,29}$/;
 const USERNAME_RE = /^[A-Za-z0-9._-]{3,40}$/;
 const DEFAULT_ORIGINS = [
@@ -157,7 +162,11 @@ async function verifyPassword(password, stored) {
   const parts = String(stored || '').split('$');
   if (parts.length !== 5 || parts[0] !== 'pbkdf2') return false;
   const iterations = parseInt(parts[2], 10);
-  if (!Number.isFinite(iterations) || iterations < 1000) return false;
+  // 100_000 = batas maksimal PBKDF2 yang didukung WebCrypto di Cloudflare
+  // Workers (lihat catatan di PBKDF2_ITERATIONS). Hash dengan iterasi di
+  // atas itu (mis. sisa dari konfigurasi lama) tidak valid untuk
+  // diverifikasi di runtime ini — gagal dengan aman, bukan crash 500.
+  if (!Number.isFinite(iterations) || iterations < 1000 || iterations > 100_000) return false;
   const salt = b64urlDecode(parts[3]);
   const expected = b64urlDecode(parts[4]);
   const actual = await pbkdf2(password, salt, iterations);
@@ -686,7 +695,7 @@ async function handlePublic(request, env) {
 
     // Selalu jalankan verifikasi (dengan hash dummy kalau user tidak ada)
     // supaya waktu respons tidak membocorkan username mana yang valid.
-    const ok = await verifyPassword(password, user?.passwordHash || 'pbkdf2$sha256$210000$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
+    const ok = await verifyPassword(password, user?.passwordHash || `pbkdf2$sha256$${PBKDF2_ITERATIONS}$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA`);
 
     if (!cms || !user || !ok) {
       await rateLimitHit(db, `login:ip:${ip}`);
